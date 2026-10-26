@@ -1,0 +1,41 @@
+name: Maple Store alert
+
+on:
+  schedule:
+    # Every 15 minutes. Odd minutes avoid GitHub's busiest moments (:00, :30).
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch: # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: write # needed to save seen_ids.json back to the repo
+
+concurrency:
+  group: maple-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Maple Store and send WhatsApp alerts
+        env:
+          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+        run: python check_maple.py
+
+      - name: Save seen listings
+        run: |
+          if [ -n "$(git status --porcelain seen_ids.json)" ]; then
+            git config user.name "maple-alert-bot"
+            git config user.email "maple-alert-bot@users.noreply.github.com"
+            git add seen_ids.json
+            git commit -m "Update seen listings"
+            git push
+          fi
