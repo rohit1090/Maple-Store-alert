@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Maple Store new-listing alert -> WhatsApp (via CallMeBot).
+"""Maple Store new-listing alert -> Telegram.
 
 Checks Maple Store's iPhone collections, compares them with the listings
-seen on earlier runs (seen_ids.json), and sends one WhatsApp message for
+seen on earlier runs (seen_ids.json), and sends one Telegram message for
 anything new that is in stock.
 
 Environment variables (set as GitHub secrets):
-  CALLMEBOT_PHONE   your WhatsApp number with country code, e.g. +919876543210
-  CALLMEBOT_APIKEY  the API key CallMeBot sent you
+  TELEGRAM_BOT_TOKEN  the token BotFather gave you
+  TELEGRAM_CHAT_ID    your chat ID (a number)
 """
 
 import json
@@ -107,22 +107,35 @@ def describe(product):
     return line
 
 
-def send_whatsapp(text):
-    phone = os.environ["CALLMEBOT_PHONE"].strip()
-    api_key = os.environ["CALLMEBOT_APIKEY"].strip()
-    query = urllib.parse.urlencode({"phone": phone, "text": text, "apikey": api_key})
+def send_message(text):
+    """Send a Telegram message. Raises RuntimeError on any failure.
+
+    The error text never includes the bot token.
+    """
+    token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+    chat_id = os.environ["TELEGRAM_CHAT_ID"].strip()
+    data = urllib.parse.urlencode(
+        {
+            "chat_id": chat_id,
+            "text": text,
+            # Several links per message: skip the big link previews.
+            "link_preview_options": json.dumps({"is_disabled": True}),
+        }
+    ).encode("utf-8")
     req = urllib.request.Request(
-        "https://api.callmebot.com/whatsapp.php?" + query,
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=data,
         headers={"User-Agent": USER_AGENT},
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"CallMeBot returned HTTP {resp.status}")
+            body = json.loads(resp.read().decode("utf-8"))
+        if not body.get("ok"):
+            raise RuntimeError("Telegram did not accept the message")
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"CallMeBot returned HTTP {e.code}") from None
+        raise RuntimeError(f"Telegram returned HTTP {e.code}") from None
     except urllib.error.URLError as e:
-        raise RuntimeError(f"CallMeBot unreachable: {e.reason}") from None
+        raise RuntimeError(f"Telegram unreachable: {e.reason}") from None
 
 
 def notify_new(products):
@@ -132,9 +145,9 @@ def notify_new(products):
     ]
     for index, chunk in enumerate(chunks):
         header = f"New on Maple Store ({len(products)} new)\n\n" if index == 0 else ""
-        send_whatsapp(header + "\n\n".join(describe(p) for p in chunk))
+        send_message(header + "\n\n".join(describe(p) for p in chunk))
         if index < len(chunks) - 1:
-            time.sleep(3)  # be gentle with CallMeBot's rate limit
+            time.sleep(2)  # stay well inside Telegram's rate limits
 
 
 def load_seen():
@@ -162,7 +175,7 @@ def main():
         # First run: remember what is already listed so we do not send an
         # alert for every existing phone.
         save_seen(all_ids)
-        send_whatsapp(
+        send_message(
             f"Maple alert is on. Tracking {len(all_ids)} current listings "
             f"({', '.join(MODELS)}). You will be messaged when new ones appear."
         )
