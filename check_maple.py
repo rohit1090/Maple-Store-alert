@@ -3,7 +3,8 @@
 
 Checks Maple Store's iPhone collections, compares them with the listings
 seen on earlier runs (seen_ids.json), and sends a Telegram message for new,
-in-stock phones that match your filters (model, price, storage, colour).
+in-stock phones that match your filters (model, price, storage, colour,
+battery health).
 
 Environment variables (set as GitHub secrets):
   TELEGRAM_BOT_TOKEN  the token BotFather gave you
@@ -43,6 +44,8 @@ MODEL_MAX_PRICE = {
 STORAGES = ["128GB", "256GB"]  # use [] for any storage
 COLOURS = ["Black", "Blue", "Green"]  # use [] for any colour
 
+MIN_BATTERY = 90  # alert only if battery health is at least this %. 0 = ignore
+
 ITEMS_PER_MESSAGE = 10
 PAGE_SIZE = 250
 STATE_FILE = Path(__file__).with_name("seen_ids.json")
@@ -58,12 +61,12 @@ STORAGE_SET = {re.sub(r"\s+", "", s).upper() for s in STORAGES}
 COLOUR_SET = {c.casefold() for c in COLOURS}
 
 
-def http_get(url, retries=2):
+def http_get(url, retries=2, accept="application/json"):
     last_error = None
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(
-                url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+                url, headers={"User-Agent": USER_AGENT, "Accept": accept}
             )
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.read().decode("utf-8")
@@ -89,6 +92,36 @@ def fetch_collection(handle):
         page += 1
         time.sleep(1)
     return products
+
+
+# "Battery: <b>81%</b>" sits inside the product's own block (id="Sku-template--...__main").
+# Other products shown further down the page have the same text, so the main
+# block is looked at first.
+BATTERY_RE = re.compile(r"Battery\s*:?\s*(?:<[^>]*>\s*)*(\d{1,3})\s*%", re.IGNORECASE)
+MAIN_BLOCK_RE = re.compile(r'id="Sku-template--[^"]*__main"', re.IGNORECASE)
+
+
+def parse_battery(html):
+    """Battery % of the main product on a Maple product page, or None."""
+    block = MAIN_BLOCK_RE.search(html)
+    if block:
+        m = BATTERY_RE.search(html, block.end(), block.end() + 600)
+        if m:
+            return int(m.group(1))
+    m = BATTERY_RE.search(html)  # fallback: first battery figure on the page
+    return int(m.group(1)) if m else None
+
+
+def battery_of(product):
+    """Fetch the product page and read its battery %. None if it cannot be read."""
+    url = f"{BASE}/products/{product['handle']}"
+    try:
+        value = parse_battery(http_get(url, accept="text/html"))
+    except Exception as exc:
+        print(f"Battery lookup failed for {product['title']}: {exc}")
+        return None
+    print(f"Battery for {product['title']}: {value if value is not None else 'not found'}")
+    return value
 
 
 def inr(value):
@@ -160,7 +193,7 @@ def filter_reason(product):
     return None
 
 
-def describe(product):
+def describe(product, battery=None):
     parts = split_title(product["title"])
     if parts and re.fullmatch(r"pre-?owned", parts[-1], re.IGNORECASE):
         parts = parts[:-1]
@@ -173,8 +206,17 @@ def describe(product):
             line += f" (was {inr(compare)})"
     except (TypeError, ValueError):
         pass
+    if MIN_BATTERY:
+        line += f" · Battery {battery}%" if battery is not None else " · Battery ? (check page)"
     line += f"\n{BASE}/products/{product['handle']}"
     return line
+
+
+def battery_reason(battery):
+    """None if the battery is fine (or unknown, so a phone is never missed)."""
+    if MIN_BATTERY and battery is not None and battery < MIN_BATTERY:
+        return f"battery {battery}% is below {MIN_BATTERY}%"
+    return None
 
 
 def send_message(text):
@@ -208,7 +250,7 @@ def send_message(text):
         raise RuntimeError(f"Telegram unreachable: {e.reason}") from None
 
 
-def notify_new(products):
+def notify_new(products, batteries):
     """products must already be sorted cheapest first."""
     chunks = [
         products[i : i + ITEMS_PER_MESSAGE]
@@ -222,7 +264,8 @@ def notify_new(products):
                 f"New on Maple Store: {count} phone{'s' if count != 1 else ''}"
                 f" (cheapest first)\n\n"
             )
-        send_message(header + "\n\n".join(describe(p) for p in chunk))
+        body = "\n\n".join(describe(p, batteries.get(p["id"])) for p in chunk)
+        send_message(header + body)
         if index < len(chunks) - 1:
             time.sleep(2)  # stay well inside Telegram's rate limits
 
@@ -243,17 +286,24 @@ def run_test(found):
         p for p in found.values() if is_available(p) and filter_reason(p) is None
     ]
     candidates.sort(key=lambda p: price_of(p) or float("inf"))
-    if candidates:
+    chosen, chosen_battery = None, None
+    for p in candidates[:10]:  # look at the 10 cheapest at most
+        battery = battery_of(p) if MIN_BATTERY else None
+        time.sleep(1)
+        if battery_reason(battery) is None:
+            chosen, chosen_battery = p, battery
+            break
+    if chosen:
         send_message(
             "TEST message (this phone is not new, nothing was changed):\n\n"
-            + describe(candidates[0])
+            + describe(chosen, chosen_battery)
         )
     else:
         send_message(
-            "TEST message: Telegram works, but no in-stock phone matches "
-            "your filters right now."
+            "TEST message: Telegram works, but none of the cheapest in-stock "
+            "phones match your filters right now."
         )
-    print(f"Test message sent. {len(candidates)} in-stock phones match your filters.")
+    print(f"Test message sent. {len(candidates)} in-stock phones match the basic filters.")
 
 
 def main():
@@ -293,6 +343,21 @@ def main():
             matching.append(p)
         else:
             print(f"New but skipped: {p['title']} ({reason})")
+
+    # Battery is only on each phone's own page, so look it up for the few
+    # new phones that already passed every other filter.
+    batteries = {}
+    if MIN_BATTERY and matching:
+        kept = []
+        for p in matching:
+            batteries[p["id"]] = battery_of(p)
+            time.sleep(1)
+            reason = battery_reason(batteries[p["id"]])
+            if reason is None:
+                kept.append(p)
+            else:
+                print(f"New but skipped: {p['title']} ({reason})")
+        matching = kept
     matching.sort(key=lambda p: price_of(p) or float("inf"))
 
     print(
@@ -301,7 +366,7 @@ def main():
     )
 
     if matching:
-        notify_new(matching)  # raises on failure, so state is not saved
+        notify_new(matching, batteries)  # raises on failure, so state is not saved
         print(f"Sent alert for {len(matching)} new phones.")
 
     if not all_ids <= seen:
